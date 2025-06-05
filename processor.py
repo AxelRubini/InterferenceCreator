@@ -1,9 +1,11 @@
+# processor.py
+
 import pandas as pd
 import os
 import re
 
 # =============================================================================
-# CONFIGURAZIONE DI DEFAULT (ora qui, in processor)
+# CONFIGURAZIONE DI DEFAULT
 # =============================================================================
 DEFAULT_ZONE_ORDER = [
     "Infeed",
@@ -22,13 +24,22 @@ class InterferenceProcessor:
     Classe responsabile di:
     - leggere il file Excel (.xlsx o .xls)
     - filtrare le righe di DynamicInterference
-    - raccogliere le zone di no-interference
-    - generare i due file di output (chart_config.txt e interferences_summary.txt)
+    - raccogliere le zone di no-interferenza (qualunque prefisso ‘StartNo…’/‘EndNo…’)
+      fino a due zone (ordinal 1 e 2)
+    - generare due file di output:
+        * chart_config.txt (NoInterf1 contiene tag 1st+2nd)
+        * interferences_summary.txt
+      fino a tre grafici per pagina: ChartLeft, ChartRight, ChartCenter.
     """
 
-    def __init__(self, excel_path: str, sheet_name: str,
-                 output_chart: str, output_summary: str,
-                 zone_order=None):
+    def __init__(
+        self,
+        excel_path: str,
+        sheet_name: str,
+        output_chart: str,
+        output_summary: str,
+        zone_order=None,
+    ):
         self.excel_path = excel_path
         self.sheet_name = sheet_name
         self.output_chart = output_chart
@@ -37,18 +48,16 @@ class InterferenceProcessor:
 
         self.df_vars = None
         self.df_dyn = None
-        self.inter_grouped = []
-        self.summary_grouped = []
+        self.inter_grouped = []   # lista di tuple (zone_idx, idx_num, riga_chart)
+        self.summary_grouped = [] # lista di tuple (zone_idx, idx_num, pagina, "Interferences : A/B")
 
     def load_data(self):
         """
-        Legge il file Excel (supporta sia .xlsx che .xls) e verifica la presenza delle colonne obbligatorie.
-        Se il file è .xlsx, usa engine="openpyxl"; se è .xls, usa engine="xlrd".
+        Legge il file Excel (supporta .xlsx e .xls) e verifica la presenza delle colonne obbligatorie.
         """
         if not os.path.isfile(self.excel_path):
             raise FileNotFoundError(f"File non trovato: '{self.excel_path}'")
 
-        # Determino l'estensione del file e scelgo l'engine corretto
         ext = os.path.splitext(self.excel_path)[1].lower()
         if ext == ".xlsx":
             engine = "openpyxl"
@@ -59,9 +68,7 @@ class InterferenceProcessor:
 
         try:
             self.df_vars = pd.read_excel(
-                self.excel_path,
-                sheet_name=self.sheet_name,
-                engine=engine
+                self.excel_path, sheet_name=self.sheet_name, engine=engine
             )
         except Exception as e:
             raise ValueError(f"Errore apertura foglio '{self.sheet_name}' ({ext}): {e}")
@@ -79,7 +86,9 @@ class InterferenceProcessor:
             raise ValueError(f"Mancano colonne nel foglio '{self.sheet_name}': {missing}")
 
     def filter_dynamic_interference(self):
-        """Filtra le righe con DataType BOOL e DescrizioneEstensione contenente 'DynamicInterference'."""
+        """
+        Filtra le righe con DataType == "BOOL" e DescrizioneEstensione contenente 'DynamicInterference'.
+        """
         self.df_dyn = self.df_vars[
             (self.df_vars["DataType"] == "BOOL")
             & (self.df_vars["DescrizioneEstensione"].str.contains("DynamicInterference", na=False))
@@ -91,7 +100,7 @@ class InterferenceProcessor:
     @staticmethod
     def estrai_motori_da_root(root: str):
         """
-        Da root del tipo "MC4_MotoreA_MC4_MotoreB" restituisce (prefix, motoreA, motoreB).
+        Da root come "MC4_MOTOREA_MC4_MOTOREB" restituisce (prefix, motoreA, motoreB).
         Se il formato non è corretto solleva ValueError.
         """
         tokens = root.split("_")
@@ -108,7 +117,7 @@ class InterferenceProcessor:
     @staticmethod
     def genera_tag_plc(obj_type: str, descr_ext: str, idx_val):
         """
-        Genera tag PLC nel formato: <ObjectType>_<DescrizioneEstensione>_<IndexInt>
+        Genera tag PLC nel formato: <ObjectType>_<DescrizioneEstensione>_<IndexInt>.
         Se idx_val è NaN o non convertibile, ritorna stringa vuota.
         """
         primo_tipo = obj_type.split(";")[0].strip() if isinstance(obj_type, str) else ""
@@ -122,51 +131,83 @@ class InterferenceProcessor:
 
     def raccogli_zone_no_interf(self, motX: str, motY: str, prefix: str):
         """
-        Estrae due liste di coppie (tag_start, tag_end) per:
-          - zone1: "StartNoInterference_…", "EndNoInterference_…"
-          - zone2: "StartNoInterference2nd_…", "EndNoInterference2nd_…"
-        Considera DescrizioneRadice sia con underscore sia senza.
+        Estrae due liste di coppie (tag_start, tag_end) per le prime due “zone”:
+          - include qualunque DescrizioneEstensione che inizia con "StartNo" / "EndNo"
+            e contiene il nome del motore motY.
+          - Riconosce ordinali nel nome: “1st”, “2nd”, “3rd”…
+            * Se non trova “1st”/“2nd”/“3rd”, assume ordinal=1.
+          - Restituisce due liste: (zone1_list, zone2_list), ognuna come [(tag_s, tag_e), …],
+            con ordinal == 1 e ordinal == 2. Eventuali ordinal >= 3 vengono ignorati.
         """
         motX_no_us = motX.replace("_", "")
         root_with = f"{prefix}_{motX}"
         root_without = f"{prefix}_{motX_no_us}"
 
-        base_mask = (
+        # Filtra le righe che appartenengono al root (con o senza underscore)
+        mask_base = (
             ((self.df_vars["DescrizioneRadice"] == root_with)
              | (self.df_vars["DescrizioneRadice"] == root_without))
             & (self.df_vars["DescrizioneEstensione"].str.contains(motY, na=False))
         )
-        df_base = self.df_vars[base_mask].copy()
+        df_base = self.df_vars[mask_base].copy()
 
-        p1_s = df_base["DescrizioneEstensione"].str.startswith("StartNoInterference_", na=False)
-        p1_e = df_base["DescrizioneEstensione"].str.startswith("EndNoInterference_", na=False)
-        p2_s = df_base["DescrizioneEstensione"].str.startswith("StartNoInterference2nd_", na=False)
-        p2_e = df_base["DescrizioneEstensione"].str.startswith("EndNoInterference2nd_", na=False)
+        # Seleziona tutte le righe "StartNo..." e "EndNo..."
+        df_start = df_base[df_base["DescrizioneEstensione"].str.startswith("StartNo", na=False)].copy()
+        df_end   = df_base[df_base["DescrizioneEstensione"].str.startswith("EndNo", na=False)].copy()
 
-        df_z1 = df_base[p1_s | p1_e]
-        df_z2 = df_base[p2_s | p2_e]
+        # Funzione per estrarre ordinal: cerca "1st", "2nd", "3rd" (case-insensitive),
+        # altrimenti ritorna 1.
+        def estrai_ordinal(descr_ext: str) -> int:
+            m = re.search(r"(?i)(\d+)(?:st|nd|rd|th)", descr_ext)
+            if m:
+                try:
+                    return int(m.group(1))
+                except:
+                    return 1
+            # Se non trova suffisso numerico, consideralo prima zona (ordinal=1)
+            return 1
 
-        def ordina_accoppia(dfz):
-            if dfz.empty:
-                return []
-            dfz_start = dfz[dfz["DescrizioneEstensione"].str.startswith("StartNoInterference")].sort_values(by="Index")
-            dfz_end = dfz[dfz["DescrizioneEstensione"].str.startswith("EndNoInterference")].sort_values(by="Index")
-            n = min(len(dfz_start), len(dfz_end))
-            coppie = []
-            for i in range(n):
-                r_s = dfz_start.iloc[i]
-                r_e = dfz_end.iloc[i]
+        # Costruisci lista di tuple (ordinal, index, tag) per start ed end
+        starts = []
+        for _, r in df_start.iterrows():
+            ord_val = estrai_ordinal(r["DescrizioneEstensione"])
+            starts.append((ord_val, r["Index"], r))
+
+        ends = []
+        for _, r in df_end.iterrows():
+            ord_val = estrai_ordinal(r["DescrizioneEstensione"])
+            ends.append((ord_val, r["Index"], r))
+
+        # Ordina per ordinal ASC, poi per Index ASC
+        starts.sort(key=lambda x: (x[0], x[1]))
+        ends.sort(key=lambda x: (x[0], x[1]))
+
+        # Appiattisci i record raggruppando per ordinal 1st e 2nd
+        zone1 = []
+        zone2 = []
+
+        # Per ogni ordinal 1 o 2, prendi la prima coppia start/end se esistono
+        for ordinal_target, zone_list in [(1, zone1), (2, zone2)]:
+            # Filtra tutti i start con quell'ordinal_target
+            starts_ord = [row for (ordv, _, row) in starts if ordv == ordinal_target]
+            ends_ord   = [row for (ordv, _, row) in ends   if ordv == ordinal_target]
+
+            # Prendi il minimo tra len(starts_ord) e len(ends_ord)
+            n_coppie = min(len(starts_ord), len(ends_ord))
+            for i in range(n_coppie):
+                r_s = starts_ord[i]
+                r_e = ends_ord[i]
                 tag_s = self.genera_tag_plc(r_s["ObjectType"], r_s["DescrizioneEstensione"], r_s["Index"])
                 tag_e = self.genera_tag_plc(r_e["ObjectType"], r_e["DescrizioneEstensione"], r_e["Index"])
-                coppie.append((tag_s, tag_e))
-            return coppie
+                zone_list.append((tag_s, tag_e))
 
-        return ordina_accoppia(df_z1), ordina_accoppia(df_z2)
+        return zone1, zone2
 
     def parse_zone_and_index(self, page_name: str):
         """
-        Estrae (zone_idx, index_num) dal nome pagina basato su self.zone_order.
-        Se non trova numero, assume index_num = 1. Se non trova zona, assume zone_idx = len(zone_order).
+        Restituisce (zone_idx, index_num) basato su self.zone_order e numero finale.
+        - Se es. 'Wheel1' senza indice => (idx di Wheel1, 1)
+        - Se manca completamente => (len(zone_order), 1)
         """
         p_lower = page_name.lower()
         for idx, zone in enumerate(self.zone_order):
@@ -175,10 +216,9 @@ class InterferenceProcessor:
                 match = re.search(rf"{zone_lower}[_\-]?(\d+)", p_lower, re.IGNORECASE)
                 if match:
                     try:
-                        num = int(match.group(1))
+                        return idx, int(match.group(1))
                     except:
-                        num = 1
-                    return idx, num
+                        return idx, 1
                 return idx, 1
         return len(self.zone_order), 1
 
@@ -186,12 +226,15 @@ class InterferenceProcessor:
         """
         Processo principale:
         - Filtra DynamicInterference
-        - Costruisce inter_grouped e summary_grouped
+        - Per ogni coppia motori genera fino a 3 grafici (ChartLeft/Right/Center)
+        - Monta NoInterf1 come concatenazione di tutti i tag 1st e 2nd
         - Ordina in base a (zone_idx, idx_num)
         """
         self.filter_dynamic_interference()
         self.inter_grouped.clear()
         self.summary_grouped.clear()
+
+        page_chart_counter = {}
 
         for _, row in self.df_dyn.iterrows():
             root = row["DescrizioneRadice"]
@@ -204,58 +247,76 @@ class InterferenceProcessor:
             except ValueError:
                 continue
 
-            zone1_A, zone2_A = self.raccogli_zone_no_interf(motA, motB, prefix)
-            zone1_B, zone2_B = self.raccogli_zone_no_interf(motB, motA, prefix)
+            # Itera sui due motori: per ognuno assegna il grafico in base a quante volte compare pagina
+            for motore, function_type in [(motA, "Axe1_RefPosition"), (motB, "Axe2_RefPosition")]:
+                if pagina not in page_chart_counter:
+                    page_chart_counter[pagina] = 0
 
-            def monta(lista_coppie):
-                if not lista_coppie:
-                    return ""
-                flat = []
-                for s, e in lista_coppie:
-                    if s: flat.append(s)
-                    if e: flat.append(e)
-                return ",".join(flat)
+                idx_counter = page_chart_counter[pagina]
+                if idx_counter == 0:
+                    chart_name = "ChartLeft"
+                elif idx_counter == 1:
+                    chart_name = "ChartRight"
+                elif idx_counter == 2:
+                    chart_name = "ChartCenter"
+                else:
+                    # Ignora motori oltre il terzo per la stessa pagina
+                    print(
+                        f"[WARNING] Pagina '{pagina}' già ha 3 grafici; "
+                        f"skipping motore '{motore}'."
+                    )
+                    continue
 
-            no_int1_A = monta(zone1_A)
-            no_int2_A = monta(zone2_A)
-            no_int1_B = monta(zone1_B)
-            no_int2_B = monta(zone2_B)
+                # Raccogli tag 1st e 2nd (nomi arbitrari "No…") e concatena in NoInterf1
+                motY = motB if motore == motA else motA
+                zone1, zone2 = self.raccogli_zone_no_interf(motore, motY, prefix)
 
-            rA = [
-                pagina,
-                "ChartLeft",
-                "",
-                "Doughnut",
-                "0",
-                "360",
-                motA,
-                "Axe1_RefPosition",
-                no_int1_A,
-                no_int2_A,
-            ]
-            rB = [
-                pagina,
-                "ChartRight",
-                "",
-                "Doughnut",
-                "0",
-                "360",
-                motB,
-                "Axe2_RefPosition",
-                no_int1_B,
-                no_int2_B,
-            ]
+                all_zones = zone1 + zone2
 
-            zone_idx, idx_num = self.parse_zone_and_index(pagina)
-            self.inter_grouped.append((zone_idx, idx_num, rA, rB))
-            self.summary_grouped.append((zone_idx, idx_num, pagina, f"Interferences : {motA}/{motB}"))
+                def monta(lista_coppie):
+                    if not lista_coppie:
+                        return ""
+                    flat = []
+                    for s, e in lista_coppie:
+                        if s:
+                            flat.append(s)
+                        if e:
+                            flat.append(e)
+                    return ",".join(flat)
 
+                no_interf1 = monta(all_zones)
+                no_interf2 = ""  # rimane vuoto
+
+                riga_chart = [
+                    pagina,        # pagina
+                    chart_name,    # nome: ChartLeft/ChartRight/ChartCenter
+                    "",            # visiblePlc (vuoto)
+                    "Doughnut",    # Type
+                    "0",           # Rotation
+                    "360",         # Period
+                    motore,        # Title
+                    function_type, # FunctionType
+                    no_interf1,    # NoInterf1 (1st+2nd tag)
+                    no_interf2,    # NoInterf2 (vuoto)
+                ]
+
+                zone_idx, idx_num = self.parse_zone_and_index(pagina)
+                self.inter_grouped.append((zone_idx, idx_num, riga_chart))
+
+                # Aggiungi summary **solo** per motA (per evitare duplicati)
+                if motore == motA:
+                    summary_str = f"Interferences : {motA}/{motB}"
+                    self.summary_grouped.append((zone_idx, idx_num, pagina, summary_str))
+
+                page_chart_counter[pagina] += 1
+
+        # Ordina i risultati
         self.inter_grouped.sort(key=lambda x: (x[0], x[1]))
         self.summary_grouped.sort(key=lambda x: (x[0], x[1]))
 
     def write_chart_config(self):
         """
-        Scrive il file chart_config.txt con header + righe tab-separated.
+        Scrive chart_config.txt con header e righe tab-separated.
         """
         header = [
             "pagina",
@@ -271,13 +332,12 @@ class InterferenceProcessor:
         ]
         with open(self.output_chart, "w", encoding="utf-8") as f:
             f.write("\t".join(header) + "\n")
-            for _, _, rA, rB in self.inter_grouped:
-                f.write("\t".join(rA) + "\n")
-                f.write("\t".join(rB) + "\n")
+            for _, _, riga in self.inter_grouped:
+                f.write("\t".join(riga) + "\n")
 
     def write_summary(self):
         """
-        Scrive il file interferences_summary.txt con header + righe tab-separated.
+        Scrive interferences_summary.txt con header e righe tab-separated.
         """
         with open(self.output_summary, "w", encoding="utf-8") as f2:
             f2.write("pagina\tInterferences\n")
@@ -286,11 +346,11 @@ class InterferenceProcessor:
 
     def run(self):
         """
-        Esegue l'intero flusso:
-        - load_data
-        - process
-        - write_chart_config
-        - write_summary
+        Flusso completo:
+        1. load_data()
+        2. process()
+        3. write_chart_config()
+        4. write_summary()
         """
         self.load_data()
         self.process()
